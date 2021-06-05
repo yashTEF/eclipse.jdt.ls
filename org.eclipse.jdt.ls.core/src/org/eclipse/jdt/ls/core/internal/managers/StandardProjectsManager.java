@@ -18,30 +18,36 @@ import static org.eclipse.jdt.ls.core.internal.JavaLanguageServerPlugin.logInfo;
 import static org.eclipse.jdt.ls.core.internal.ResourceUtils.isContainedIn;
 
 import java.io.File;
+import java.io.InputStream;
 import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Hashtable;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import org.eclipse.buildship.core.internal.CorePlugin;
-import org.eclipse.buildship.core.internal.preferences.PersistentModel;
+import org.eclipse.core.internal.preferences.EclipsePreferences;
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IFolder;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.core.resources.ISaveContext;
+import org.eclipse.core.resources.IncrementalProjectBuilder;
 import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.core.resources.WorkspaceJob;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.IConfigurationElement;
 import org.eclipse.core.runtime.IExtensionPoint;
@@ -53,11 +59,17 @@ import org.eclipse.core.runtime.Path;
 import org.eclipse.core.runtime.Platform;
 import org.eclipse.core.runtime.Status;
 import org.eclipse.core.runtime.SubMonitor;
+import org.eclipse.core.runtime.URIUtil;
 import org.eclipse.core.runtime.jobs.Job;
 import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
+import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+import org.eclipse.jdt.internal.formatter.DefaultCodeFormatterOptions;
+import org.eclipse.jdt.launching.AbstractVMInstall;
+import org.eclipse.jdt.launching.IVMInstall;
+import org.eclipse.jdt.launching.JavaRuntime;
 import org.eclipse.jdt.ls.core.internal.ActionableNotification;
 import org.eclipse.jdt.ls.core.internal.IConstants;
 import org.eclipse.jdt.ls.core.internal.JDTUtils;
@@ -75,8 +87,10 @@ import org.eclipse.lsp4j.FileSystemWatcher;
 import org.eclipse.lsp4j.MessageType;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.WatchKind;
+import org.xml.sax.InputSource;
 
 public class StandardProjectsManager extends ProjectsManager {
+	private final static String FORMATTER_OPTION_PREFIX = JavaCore.PLUGIN_ID + ".formatter"; //$NON-NLS-1$
 	protected static final String BUILD_SUPPORT_EXTENSION_POINT_ID = "buildSupport";
 	private static final Set<String> watchers = new LinkedHashSet<>();
 	private PreferenceManager preferenceManager;
@@ -117,21 +131,23 @@ public class StandardProjectsManager extends ProjectsManager {
 
 	private void deleteInvalidProjects(Collection<IPath> rootPaths, IProgressMonitor monitor) {
 		List<String> workspaceProjects = rootPaths.stream().map((IPath rootPath) -> ProjectUtils.getWorkspaceInvisibleProjectName(rootPath)).collect(Collectors.toList());
-		List<IProject> validGradleProjects = new ArrayList<>();
-		List<IProject> suspiciousGradleProjects = new ArrayList<>();
+		ArrayList<IProject> deleteProjectCandates = new ArrayList<>();
 		for (IProject project : ProjectUtils.getAllProjects()) {
 			if (project.equals(getDefaultProject())) {
 				continue;
 			}
-			if (project.exists() && (ResourceUtils.isContainedIn(project.getLocation(), rootPaths) || ProjectUtils.isGradleProject(project) || workspaceProjects.contains(project.getName()))) {
+
+			boolean hasSpecificDeleteProjectLogic = false;
+			Optional<IBuildSupport> buildSupportOpt = BuildSupportManager.find(project);
+			if (buildSupportOpt.isPresent()) {
+				hasSpecificDeleteProjectLogic = buildSupportOpt.get().hasSpecificDeleteProjectLogic();
+			}
+
+			if (project.exists() && (ResourceUtils.isContainedIn(project.getLocation(), rootPaths) || workspaceProjects.contains(project.getName()) || hasSpecificDeleteProjectLogic)) {
 				try {
 					project.getDescription();
-					if (ProjectUtils.isGradleProject(project)) {
-						if (ResourceUtils.isContainedIn(project.getLocation(), rootPaths)) {
-							validGradleProjects.add(project);
-						} else {
-							suspiciousGradleProjects.add(project);
-						}
+					if (hasSpecificDeleteProjectLogic) {
+						deleteProjectCandates.add(project);
 					}
 				} catch (CoreException e) {
 					try {
@@ -149,61 +165,8 @@ public class StandardProjectsManager extends ProjectsManager {
 			}
 		}
 
-		List<IProject> unrelatedProjects = findUnrelatedGradleProjects(suspiciousGradleProjects, validGradleProjects);
-		unrelatedProjects.forEach((project) -> {
-			try {
-				project.delete(false, true, monitor);
-			} catch (CoreException e1) {
-				JavaLanguageServerPlugin.logException(e1.getMessage(), e1);
-			}
-		});
-	}
+		BuildSupportManager.obtainBuildSupports().stream().filter(IBuildSupport::hasSpecificDeleteProjectLogic).forEach(buildSupport -> buildSupport.deleteInvalidProjects(rootPaths, deleteProjectCandates, monitor));
 
-	/**
-	 * Find those gradle projects not referenced by any gradle project in the current workspace.
-	 */
-	private List<IProject> findUnrelatedGradleProjects(List<IProject> suspiciousProjects, List<IProject> validProjects) {
-		suspiciousProjects.sort((IProject p1, IProject p2) -> p1.getLocation().toOSString().length() - p2.getLocation().toOSString().length());
-
-		List<IProject> unrelatedCandidates = new ArrayList<>();
-		Collection<IPath> validSubPaths = new ArrayList<>();
-		for (IProject suspiciousProject : suspiciousProjects) {
-			if (validSubPaths.contains(suspiciousProject.getFullPath().makeRelative())) {
-				continue;
-			}
-
-			// Check whether the suspicious gradle project is the parent project of the opening project.
-			boolean isParentProject = false;
-			Collection<IPath> subpaths = null;
-			PersistentModel model = CorePlugin.modelPersistence().loadModel(suspiciousProject);
-			if (model.isPresent()) {
-				subpaths = model.getSubprojectPaths();
-				if (!subpaths.isEmpty()) {
-					for (IProject validProject : validProjects) {
-						if (subpaths.contains(validProject.getFullPath().makeRelative())) {
-							isParentProject = true;
-							break;
-						}
-					}
-				}
-			}
-
-			if (isParentProject) {
-				validSubPaths.addAll(subpaths);
-			} else {
-				unrelatedCandidates.add(suspiciousProject);
-			}
-		}
-
-		List<IProject> result = new ArrayList<>();
-		// Exclude those projects which are the subprojects of the verified parent project.
-		for (IProject candidate : unrelatedCandidates) {
-			if (!validSubPaths.contains(candidate.getFullPath().makeRelative())) {
-				result.add(candidate);
-			}
-		}
-
-		return result;
 	}
 
 	@Override
@@ -211,21 +174,50 @@ public class StandardProjectsManager extends ProjectsManager {
 		if (uriString == null) {
 			return;
 		}
+		boolean configureNeeded = false;
+		String formatterUrl = preferenceManager.getPreferences().getFormatterUrl();
+		if (formatterUrl != null && JavaLanguageServerPlugin.getInstance().getProtocol() != null) {
+			URI uri = JDTUtils.toURI(uriString);
+			List<URI> uris = getURIs(formatterUrl);
+			boolean changed = false;
+			for (URI formatterUri : uris) {
+				if (URIUtil.sameURI(formatterUri, uri)) {
+					changed = true;
+					break;
+				}
+			}
+			if (changed) {
+				if (changeType == CHANGE_TYPE.DELETED || changeType == CHANGE_TYPE.CREATED) {
+					registerWatchers();
+				}
+				configureNeeded = true;
+			}
+		}
+		String settingsUrl = preferenceManager.getPreferences().getSettingsUrl();
+		if (settingsUrl != null && JavaLanguageServerPlugin.getInstance().getProtocol() != null) {
+			URI uri = JDTUtils.toURI(uriString);
+			List<URI> uris = getURIs(settingsUrl);
+			boolean changed = false;
+			for (URI settingsURI : uris) {
+				if (URIUtil.sameURI(settingsURI, uri)) {
+					changed = true;
+					break;
+				}
+			}
+			if (changed) {
+				if (changeType == CHANGE_TYPE.DELETED || changeType == CHANGE_TYPE.CREATED) {
+					registerWatchers();
+				}
+				configureNeeded = true;
+			}
+		}
+		if (configureNeeded) {
+			configureSettings(preferenceManager.getPreferences());
+		}
 		IResource resource = JDTUtils.getFileOrFolder(uriString);
 		if (resource == null) {
 			return;
 		}
-		URI formatterUri = preferenceManager.getPreferences().getFormatterAsURI();
-		if (formatterUri != null) {
-			URI uri = JDTUtils.toURI(uriString);
-			if (uri != null && uri.equals(formatterUri) && JavaLanguageServerPlugin.getInstance().getProtocol() != null) {
-				if (changeType == CHANGE_TYPE.DELETED || changeType == CHANGE_TYPE.CREATED) {
-					registerWatchers();
-				}
-				FormatterManager.configureFormatter(preferenceManager.getPreferences());
-			}
-		}
-
 		try {
 			Optional<IBuildSupport> bs = getBuildSupport(resource.getProject());
 			if (bs.isPresent()) {
@@ -255,6 +247,85 @@ public class StandardProjectsManager extends ProjectsManager {
 		} catch (CoreException e) {
 			JavaLanguageServerPlugin.logException("Problem refreshing workspace", e);
 		}
+	}
+
+	/**
+	 * Configures user and formatter preferences.
+	 *
+	 * @param preferences
+	 */
+
+	public static void configureSettings(Preferences preferences) {
+		URI settingsUri = preferences.getSettingsAsURI();
+		Properties properties = null;
+		if (settingsUri != null) {
+			try (InputStream inputStream = settingsUri.toURL().openStream()) {
+				properties = new Properties();
+				properties.load(inputStream);
+			} catch (Exception e) {
+				JavaLanguageServerPlugin.logException(e.getMessage(), e);
+				return;
+			}
+		}
+		initializeDefaultOptions(preferences);
+		URI formatterUri = preferences.getFormatterAsURI();
+		Map<String, String> formatterOptions = null;
+		if (formatterUri != null) {
+			try (InputStream inputStream = formatterUri.toURL().openStream()) {
+				InputSource inputSource = new InputSource(inputStream);
+				String profileName = preferences.getFormatterProfileName();
+				formatterOptions = FormatterManager.readSettingsFromStream(inputSource, profileName);
+			} catch (Exception e) {
+				JavaLanguageServerPlugin.logException(e.getMessage(), e);
+			}
+		}
+		Map<String, String> defaultOptions = DefaultCodeFormatterOptions.getEclipseDefaultSettings().getMap();
+		if (formatterOptions != null && !formatterOptions.isEmpty()) {
+			defaultOptions.putAll(formatterOptions);
+		}
+		Hashtable<String, String> javaOptions = JavaCore.getOptions();
+		defaultOptions.entrySet().stream().filter(p -> p.getKey().startsWith(FORMATTER_OPTION_PREFIX)).forEach(p -> {
+			javaOptions.put(p.getKey(), p.getValue());
+		});
+		if (properties != null && !properties.isEmpty()) {
+			properties.forEach((k, v) -> {
+				if (k instanceof String && v instanceof String) {
+					String path = (String) k;
+					if (!"file_export_version".equals(path) && path.charAt(0) != '@' && path.charAt(0) != '!') {
+						String[] decoded = EclipsePreferences.decodePath(path);
+						String key = decoded[1];
+						if (key != null) {
+							javaOptions.put(key, (String) v);
+						}
+					}
+				}
+			});
+		}
+		JavaCore.setOptions(javaOptions);
+		new WorkspaceJob("Clean workspace...") {
+
+			@Override
+			public IStatus runInWorkspace(IProgressMonitor monitor) throws CoreException {
+				ResourcesPlugin.getWorkspace().build(IncrementalProjectBuilder.CLEAN_BUILD, monitor);
+				return Status.OK_STATUS;
+			}
+		}.schedule();
+	}
+
+	private static void initializeDefaultOptions(Preferences preferences) {
+		Hashtable<String, String> defaultOptions = JavaCore.getDefaultOptions();
+		IVMInstall defaultVM = JavaRuntime.getDefaultVMInstall();
+		if (defaultVM instanceof AbstractVMInstall) {
+			AbstractVMInstall jvm = (AbstractVMInstall) defaultVM;
+			long jdkLevel = CompilerOptions.versionToJdkLevel(jvm.getJavaVersion());
+			String compliance = CompilerOptions.versionFromJdkLevel(jdkLevel);
+			JavaCore.setComplianceOptions(compliance, defaultOptions);
+		} else {
+			JavaCore.setComplianceOptions(JavaCore.VERSION_11, defaultOptions);
+		}
+		JavaCore.setOptions(defaultOptions);
+		PreferenceManager.initialize();
+		preferences.updateTabSizeInsertSpaces(defaultOptions);
 	}
 
 	@Override
@@ -350,6 +421,7 @@ public class StandardProjectsManager extends ProjectsManager {
 							for (String pattern: libraries) {
 								patterns.add(ProjectUtils.resolveGlobPath(projectFolder, pattern).toPortableString());
 							}
+							patterns.add("**/.settings");
 						}
 					}
 				}
@@ -357,23 +429,31 @@ public class StandardProjectsManager extends ProjectsManager {
 				JavaLanguageServerPlugin.logException(e.getMessage(), e);
 			}
 			List<FileSystemWatcher> fileWatchers = new ArrayList<>();
-			URI formatter = preferenceManager.getPreferences().getFormatterAsURI();
-			if (formatter != null && "file".equals(formatter.getScheme())) {
-				File file = new File(formatter);
-				if (file != null && file.isFile()) {
-					IPath formatterPath = new Path(file.getAbsolutePath());
-					if (!isContainedIn(formatterPath, sources)) {
-						sources.add(formatterPath);
-					}
-				}
-			}
 			patterns.addAll(sources.stream().map(ResourceUtils::toGlobPattern).collect(Collectors.toList()));
-
+			sources.clear();
+			URI formatter = preferenceManager.getPreferences().getFormatterAsURI();
+			if (formatter == null && preferenceManager.getPreferences().getFormatterUrl() != null) {
+				List<URI> uris = getURIs(preferenceManager.getPreferences().getFormatterUrl());
+				for (URI uri : uris) {
+					addWatcher(uri, sources);
+				}
+			} else {
+				addWatcher(formatter, sources);
+			}
+			URI settings = preferenceManager.getPreferences().getSettingsAsURI();
+			if (settings == null && preferenceManager.getPreferences().getSettingsUrl() != null) {
+				List<URI> uris = getURIs(preferenceManager.getPreferences().getSettingsUrl());
+				for (URI uri : uris) {
+					addWatcher(uri, sources);
+				}
+			} else {
+				addWatcher(settings, sources);
+			}
+			patterns.addAll(sources.stream().map(p -> ResourceUtils.toGlobPattern(p, false)).collect(Collectors.toList()));
 			for (String pattern : patterns) {
 				FileSystemWatcher watcher = new FileSystemWatcher(pattern);
 				fileWatchers.add(watcher);
 			}
-
 			// Watch on project root folders.
 			for (IProject project : projects) {
 				if (ProjectUtils.isVisibleProject(project) && project.exists()) {
@@ -396,6 +476,52 @@ public class StandardProjectsManager extends ProjectsManager {
 		return Collections.emptyList();
 	}
 
+	private List<URI> getURIs(String url) {
+		if (url == null) {
+			return Collections.emptyList();
+		}
+		List<URI> result = new ArrayList<>();
+		URI uri;
+		try {
+			uri = new URI(ResourceUtils.toClientUri(url));
+			if (uri.isAbsolute()) {
+				if ("file".equals(uri.getScheme())) {
+					url = Path.fromOSString(Paths.get(uri).toString()).toString();
+				} else {
+					result.add(uri);
+					return result;
+				}
+			}
+		} catch (URISyntaxException e) {
+			JavaLanguageServerPlugin.logException(e.getMessage(), e);
+		}
+		if (url.startsWith("/") && new File(url).isFile()) {
+			uri = new File(url).toURI();
+			result.add(uri);
+		} else {
+			Collection<IPath> rootPaths = preferenceManager.getPreferences().getRootPaths();
+			if (rootPaths != null) {
+				for (IPath rootPath : rootPaths) {
+					File f = new File(rootPath.toOSString(), url);
+					result.add(f.toURI());
+				}
+			}
+		}
+		return result;
+	}
+
+	private void addWatcher(URI uri, Set<IPath> sources) {
+		if (uri != null && "file".equals(uri.getScheme())) {
+			File file = new File(uri);
+			if (file != null) {
+				IPath path = new Path(file.getAbsolutePath());
+				if (!isContainedIn(path, sources)) {
+					sources.add(path);
+				}
+			}
+		}
+	}
+
 	@Override
 	public void registerListeners() {
 		if (this.preferenceChangeListener == null) {
@@ -403,8 +529,15 @@ public class StandardProjectsManager extends ProjectsManager {
 				@Override
 				public void preferencesChange(Preferences oldPreferences, Preferences newPreferences) {
 					if (!oldPreferences.getReferencedLibraries().equals(newPreferences.getReferencedLibraries())) {
-						registerWatcherJob.schedule(1000L);
+						registerWatcherJob.schedule(100L);
 						UpdateClasspathJob.getInstance().updateClasspath();
+					}
+					if (!Objects.equals(oldPreferences.getFormatterUrl(), newPreferences.getFormatterUrl()) || !Objects.equals(oldPreferences.getSettingsUrl(), newPreferences.getSettingsUrl())) {
+						registerWatcherJob.schedule(100L);
+					}
+					if (!Objects.equals(oldPreferences.getFormatterUrl(), newPreferences.getFormatterUrl()) || !Objects.equals(oldPreferences.getFormatterProfileName(), newPreferences.getFormatterProfileName())
+							|| !Objects.equals(oldPreferences.getSettingsUrl(), newPreferences.getSettingsUrl())) {
+						configureSettings(newPreferences);
 					}
 					if (!Objects.equals(oldPreferences.getResourceFilters(), newPreferences.getResourceFilters())) {
 						try {

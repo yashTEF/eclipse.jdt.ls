@@ -58,6 +58,15 @@ public class InvisibleProjectImporterTest extends AbstractInvisibleProjectBasedT
 	}
 
 	@Test
+	public void testProjectSettings() throws Exception {
+		IProject invisibleProject = copyAndImportFolder("singlefile/lesson1", "src/org/samples/HelloWorld.java");
+		assertTrue(invisibleProject.exists());
+		IJavaProject javaProject = JavaCore.create(invisibleProject);
+		String option = javaProject.getOption(JavaCore.COMPILER_PB_MISSING_SERIAL_VERSION, true);
+		assertEquals(JavaCore.IGNORE, option);
+	}
+
+	@Test
 	public void importCompleteFolderWithoutTriggerFile() throws Exception {
 		IProject invisibleProject = copyAndImportFolder("singlefile/lesson1", null);
 		assertFalse(invisibleProject.exists());
@@ -100,7 +109,7 @@ public class InvisibleProjectImporterTest extends AbstractInvisibleProjectBasedT
 
 		List<FileSystemWatcher> watchers = projectsManager.registerWatchers();
 		//watchers.sort((a, b) -> a.getGlobPattern().compareTo(b.getGlobPattern()));
-		assertEquals(10, watchers.size()); // basic(8) + project(1) + library(1)
+		assertEquals(11, watchers.size()); // basic(8) + project(1) + library(1)
 		String srcGlobPattern = watchers.stream().filter(w -> "**/src/**".equals(w.getGlobPattern())).findFirst().get().getGlobPattern();
 		assertTrue("Unexpected source glob pattern: " + srcGlobPattern, srcGlobPattern.equals("**/src/**"));
 		String projGlobPattern = watchers.stream().filter(w -> w.getGlobPattern().endsWith(projectFolder.getName() + "/**")).findFirst().get().getGlobPattern();
@@ -186,7 +195,7 @@ public class InvisibleProjectImporterTest extends AbstractInvisibleProjectBasedT
 	public void testPreviewFeaturesEnabledByDefault() throws Exception {
 		String defaultJVM = JavaRuntime.getDefaultVMInstall().getId();
 		try {
-			TestVMType.setTestJREAsDefault("15");
+			TestVMType.setTestJREAsDefault("16");
 			IProject invisibleProject = copyAndImportFolder("singlefile/java14", "foo/bar/Foo.java");
 			assertTrue(invisibleProject.exists());
 			assertNoErrors(invisibleProject);

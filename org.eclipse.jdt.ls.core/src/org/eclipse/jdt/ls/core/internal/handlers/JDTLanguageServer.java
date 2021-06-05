@@ -56,12 +56,12 @@ import org.eclipse.jdt.ls.core.internal.handlers.GenerateDelegateMethodsHandler.
 import org.eclipse.jdt.ls.core.internal.handlers.GenerateDelegateMethodsHandler.GenerateDelegateMethodsParams;
 import org.eclipse.jdt.ls.core.internal.handlers.GenerateToStringHandler.CheckToStringResponse;
 import org.eclipse.jdt.ls.core.internal.handlers.GenerateToStringHandler.GenerateToStringParams;
-import org.eclipse.jdt.ls.core.internal.handlers.InferSelectionHandler.InferSelectionParams;
-import org.eclipse.jdt.ls.core.internal.handlers.InferSelectionHandler.SelectionInfo;
 import org.eclipse.jdt.ls.core.internal.handlers.GetRefactorEditHandler.GetRefactorEditParams;
 import org.eclipse.jdt.ls.core.internal.handlers.GetRefactorEditHandler.RefactorWorkspaceEdit;
 import org.eclipse.jdt.ls.core.internal.handlers.HashCodeEqualsHandler.CheckHashCodeEqualsResponse;
 import org.eclipse.jdt.ls.core.internal.handlers.HashCodeEqualsHandler.GenerateHashCodeEqualsParams;
+import org.eclipse.jdt.ls.core.internal.handlers.InferSelectionHandler.InferSelectionParams;
+import org.eclipse.jdt.ls.core.internal.handlers.InferSelectionHandler.SelectionInfo;
 import org.eclipse.jdt.ls.core.internal.handlers.MoveHandler.MoveDestinationsResponse;
 import org.eclipse.jdt.ls.core.internal.handlers.MoveHandler.MoveParams;
 import org.eclipse.jdt.ls.core.internal.handlers.OverrideMethodsHandler.AddOverridableMethodParams;
@@ -69,7 +69,6 @@ import org.eclipse.jdt.ls.core.internal.handlers.OverrideMethodsHandler.Overrida
 import org.eclipse.jdt.ls.core.internal.handlers.WorkspaceSymbolHandler.SearchSymbolParams;
 import org.eclipse.jdt.ls.core.internal.lsp.JavaProtocolExtensions;
 import org.eclipse.jdt.ls.core.internal.managers.ContentProviderManager;
-import org.eclipse.jdt.ls.core.internal.managers.FormatterManager;
 import org.eclipse.jdt.ls.core.internal.managers.ProjectsManager;
 import org.eclipse.jdt.ls.core.internal.preferences.PreferenceManager;
 import org.eclipse.jdt.ls.core.internal.preferences.Preferences;
@@ -244,8 +243,8 @@ public class JDTLanguageServer extends BaseJDTLanguageServer implements Language
 	public void initialized(InitializedParams params) {
 		logInfo(">> initialized");
 		try {
-			Job.getJobManager().join(InitHandler.JAVA_LS_INITIALIZATION_JOBS, null);
-		} catch (OperationCanceledException | InterruptedException e) {
+			JobHelpers.waitForInitializeJobs(60 * 60 * 1000); // 1 hour
+		} catch (OperationCanceledException e) {
 			logException(e.getMessage(), e);
 		}
 		logInfo(">> initialization job finished");
@@ -369,6 +368,7 @@ public class JDTLanguageServer extends BaseJDTLanguageServer implements Language
 			}
 		}
 		CodeActionOptions options = new CodeActionOptions(codeActionKinds);
+		options.setResolveProvider(Boolean.valueOf(preferenceManager.getClientPreferences().isResolveCodeActionSupported()));
 		return options;
 	}
 
@@ -462,14 +462,13 @@ public class JDTLanguageServer extends BaseJDTLanguageServer implements Language
 		try {
 			boolean autoBuildChanged = pm.setAutoBuilding(preferenceManager.getPreferences().isAutobuildEnabled());
 			if (jvmChanged) {
-				buildWorkspace(true);
+				buildWorkspace(Either.forLeft(true));
 			} else if (autoBuildChanged) {
-				buildWorkspace(false);
+				buildWorkspace(Either.forLeft(false));
 			}
 		} catch (CoreException e) {
 			JavaLanguageServerPlugin.logException(e.getMessage(), e);
 		}
-		FormatterManager.configureFormatter(preferenceManager.getPreferences());
 		logInfo(">> New configuration: " + settings);
 	}
 
@@ -648,6 +647,23 @@ public class JDTLanguageServer extends BaseJDTLanguageServer implements Language
 	}
 
 	/* (non-Javadoc)
+	 * @see org.eclipse.lsp4j.services.TextDocumentService#resolveCodeAction(org.eclipse.lsp4j.CodeAction)
+	 */
+	@Override
+	public CompletableFuture<CodeAction> resolveCodeAction(CodeAction params) {
+		logInfo(">> codeAction/resolve");
+		// if no data property is specified, no further resolution the server can provide, so return the original result back.
+		if (params.getData() == null) {
+			return CompletableFuture.completedFuture(params);
+		}
+
+		CodeActionResolveHandler handler = new CodeActionResolveHandler();
+		return computeAsync((monitor) -> {
+			return handler.resolve(params, monitor);
+		});
+	}
+
+	/* (non-Javadoc)
 	 * @see org.eclipse.lsp4j.services.TextDocumentService#codeLens(org.eclipse.lsp4j.CodeLensParams)
 	 */
 	@Override
@@ -809,10 +825,13 @@ public class JDTLanguageServer extends BaseJDTLanguageServer implements Language
 	 * @see org.eclipse.jdt.ls.core.internal.JavaProtocolExtensions#buildWorkspace(boolean)
 	 */
 	@Override
-	public CompletableFuture<BuildWorkspaceStatus> buildWorkspace(boolean forceReBuild) {
-		logInfo(">> java/buildWorkspace (" + (forceReBuild ? "full)" : "incremental)"));
+	public CompletableFuture<BuildWorkspaceStatus> buildWorkspace(Either<Boolean, boolean[]> forceRebuild) {
+		// See https://github.com/redhat-developer/vscode-java/issues/1929,
+		// some language client will convert the parameter to an array.
+		boolean rebuild = forceRebuild.isLeft() ? forceRebuild.getLeft() : forceRebuild.getRight()[0];
+		logInfo(">> java/buildWorkspace (" + (rebuild ? "full)" : "incremental)"));
 		BuildWorkspaceHandler handler = new BuildWorkspaceHandler(pm);
-		return computeAsyncWithClientProgress((monitor) -> handler.buildWorkspace(forceReBuild, monitor));
+		return computeAsyncWithClientProgress((monitor) -> handler.buildWorkspace(rebuild, monitor));
 	}
 
 	/* (non-Javadoc)

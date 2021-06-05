@@ -18,7 +18,9 @@ import static org.junit.Assert.assertTrue;
 
 import java.io.File;
 import java.net.URL;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.eclipse.core.runtime.FileLocator;
 import org.eclipse.core.runtime.Platform;
@@ -31,7 +33,7 @@ import org.eclipse.jdt.ls.core.internal.JDTUtils;
 import org.eclipse.jdt.ls.core.internal.JavaLanguageServerTestPlugin;
 import org.eclipse.jdt.ls.core.internal.ResourceUtils;
 import org.eclipse.jdt.ls.core.internal.TextEditUtil;
-import org.eclipse.jdt.ls.core.internal.managers.FormatterManager;
+import org.eclipse.jdt.ls.core.internal.managers.StandardProjectsManager;
 import org.eclipse.lsp4j.DocumentFormattingParams;
 import org.eclipse.lsp4j.DocumentOnTypeFormattingParams;
 import org.eclipse.lsp4j.DocumentRangeFormattingParams;
@@ -390,14 +392,14 @@ public class FormatterHandlerTest extends AbstractCompilationUnitBasedTest {
 			URL googleFormatter = bundle.getEntry("/formatter resources/eclipse-java-google-style.xml");
 			URL url = FileLocator.resolve(googleFormatter);
 			preferences.setFormatterUrl(url.toExternalForm());
-			FormatterManager.configureFormatter(preferences);
+			StandardProjectsManager.configureSettings(preferences);
 			List<? extends TextEdit> edits = server.formatting(params).get();
 			assertNotNull(edits);
 			String newText = TextEditUtil.apply(unit, edits);
 			assertEquals(text, newText);
 		} finally {
 			preferences.setFormatterUrl(null);
-			FormatterManager.configureFormatter(preferences);
+			StandardProjectsManager.configureSettings(preferences);
 		}
 	}
 
@@ -421,14 +423,14 @@ public class FormatterHandlerTest extends AbstractCompilationUnitBasedTest {
 			URL url = FileLocator.resolve(googleFormatter);
 			File file = ResourceUtils.toFile(URIUtil.toURI(url));
 			preferences.setFormatterUrl(file.getAbsolutePath());
-			FormatterManager.configureFormatter(preferences);
+			StandardProjectsManager.configureSettings(preferences);
 			List<? extends TextEdit> edits = server.formatting(params).get();
 			assertNotNull(edits);
 			String newText = TextEditUtil.apply(unit, edits);
 			assertEquals(text, newText);
 		} finally {
 			preferences.setFormatterUrl(null);
-			FormatterManager.configureFormatter(preferences);
+			StandardProjectsManager.configureSettings(preferences);
 		}
 	}
 
@@ -441,11 +443,11 @@ public class FormatterHandlerTest extends AbstractCompilationUnitBasedTest {
 			File file = ResourceUtils.toFile(URIUtil.toURI(url));
 			assertTrue(file.exists());
 			preferences.setFormatterUrl(file.getAbsolutePath());
-			FormatterManager.configureFormatter(preferences);
+			StandardProjectsManager.configureSettings(preferences);
 			assertTrue(preferences.getFormatterAsURI().isAbsolute());
 		} finally {
 			preferences.setFormatterUrl(null);
-			FormatterManager.configureFormatter(preferences);
+			StandardProjectsManager.configureSettings(preferences);
 		}
 	}
 
@@ -454,11 +456,11 @@ public class FormatterHandlerTest extends AbstractCompilationUnitBasedTest {
 		try {
 			String formatterUrl = "../../formatter/test.xml";
 			preferences.setFormatterUrl(formatterUrl);
-			FormatterManager.configureFormatter(preferences);
+			StandardProjectsManager.configureSettings(preferences);
 			assertTrue(preferences.getFormatterAsURI().isAbsolute());
 		} finally {
 			preferences.setFormatterUrl(null);
-			FormatterManager.configureFormatter(preferences);
+			StandardProjectsManager.configureSettings(preferences);
 		}
 	}
 
@@ -746,6 +748,148 @@ public class FormatterHandlerTest extends AbstractCompilationUnitBasedTest {
 
 		String newText = TextEditUtil.apply(unit, edits);
 		assertEquals(text, newText);
+	}
+
+	@Test
+	public void testUpdateFormatterVersion() throws Exception {
+		// see: https://github.com/redhat-developer/vscode-java/issues/1640
+		String text =
+			//@formatter:off
+			"package org.sample;\n\n" +
+			"public class Baz {\n"+
+				"\tpublic void test1() {\n"+
+					"\t\tObject o = new Object() {};\n"+
+				"\t}\n"+
+			"}\n";
+			//@formatter:on
+		ICompilationUnit unit = getWorkingCopy("src/org/sample/Baz.java", text);
+		String uri = JDTUtils.toURI(unit);
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		FormattingOptions options = new FormattingOptions(2, true);// ident == 2 spaces
+		DocumentFormattingParams params = new DocumentFormattingParams(textDocument, options);
+		Bundle bundle = Platform.getBundle(JavaLanguageServerTestPlugin.PLUGIN_ID);
+		URL testFormatter = bundle.getEntry("/formatter resources/version13.xml");
+		URL url = FileLocator.resolve(testFormatter);
+		File file = ResourceUtils.toFile(URIUtil.toURI(url));
+		preferences.setFormatterUrl(file.getAbsolutePath());
+		try {
+			StandardProjectsManager.configureSettings(preferences);
+			List<? extends TextEdit> edits = server.formatting(params).get();
+			assertNotNull(edits);
+			String newText = TextEditUtil.apply(unit, edits);
+			String textResult =
+			//@formatter:off
+				"package org.sample;\n\n" +
+				"public class Baz {\n"+
+				"  public void test1() {\n"+
+				"    Object o = new Object() {};\n"+
+				"  }\n"+
+				"}\n";
+				//@formatter:on
+			assertEquals(textResult, newText);
+		} finally {
+			preferences.setFormatterUrl(null);
+			StandardProjectsManager.configureSettings(preferences);
+		}
+	}
+
+	@Test
+	public void testStringFormattingWithUpdating() throws Exception {
+		//@formatter:off
+		String text = "package org.sample;\n"
+					+ "\n"
+					+ "    public      class     Baz {public void test1() {Object o = new Object() {};}}  \n";
+		//@formatter:on
+		Map<String, String> options = new HashMap<>();
+		options.put("org.eclipse.jdt.core.formatter.insert_new_line_in_empty_anonymous_type_declaration", "do not insert");
+		FormatterHandler handler = new FormatterHandler(preferenceManager);
+		String formattedText =  handler.stringFormatting(text, options, 13, monitor);
+		//@formatter:off
+		String expectedText =
+			  "package org.sample;\n"
+			+ "\n"
+			+ "public class Baz {\n"
+			+ "\tpublic void test1() {\n"
+			+ "\t\tObject o = new Object() {};\n"
+			+ "\t}\n"
+			+ "}\n";
+		//@formatter:on
+		assertEquals(formattedText, expectedText);
+	}
+
+	@Test
+	public void testStringFormatting() throws Exception {
+		//@formatter:off
+		String text = "package org.sample;\n"
+					+ "\n"
+					+ "    public      class     Baz {}  \n";
+		//@formatter:on
+		FormatterHandler handler = new FormatterHandler(preferenceManager);
+		Map<String, String> options = new HashMap<>();
+		options.put("org.eclipse.jdt.core.formatter.blank_lines_after_package", "3");
+		String formattedText =  handler.stringFormatting(text, options, 21, monitor);
+		//@formatter:off
+		String expectedText =
+			  "package org.sample;\n"
+			+ "\n"
+			+ "\n"
+			+ "\n"
+			+ "public class Baz {\n"
+			+ "}\n";
+		//@formatter:on
+		assertEquals(formattedText, expectedText);
+	}
+
+	@Test
+	public void testStringFormattingWithDefaultSettings() throws Exception {
+		//@formatter:off
+		String text = "package org.sample;\n"
+					+ "\n"
+					+ "    public      class     Baz {}  \n";
+		//@formatter:on
+		FormatterHandler handler = new FormatterHandler(preferenceManager);
+		String formattedText =  handler.stringFormatting(text, null, 21, monitor);
+		//@formatter:off
+		String expectedText =
+			  "package org.sample;\n"
+			+ "\n"
+			+ "public class Baz {\n"
+			+ "}\n";
+		//@formatter:on
+		assertEquals(formattedText, expectedText);
+	}
+
+	@Test
+	public void testProfileSettings() throws Exception {
+		assertEquals(DefaultCodeFormatterConstants.END_OF_LINE, JavaCore.getOption(DefaultCodeFormatterConstants.FORMATTER_BRACE_POSITION_FOR_BLOCK));
+		try {
+			String formatterUrl = "../../formatter/test.xml";
+			// valid profile
+			preferences.setFormatterUrl(formatterUrl);
+			preferences.setFormatterProfileName("GoogleStyle");
+			StandardProjectsManager.configureSettings(preferences);
+			assertEquals(DefaultCodeFormatterConstants.NEXT_LINE, JavaCore.getOption(DefaultCodeFormatterConstants.FORMATTER_BRACE_POSITION_FOR_BLOCK));
+			// reset
+			preferences.setFormatterUrl(null);
+			preferences.setFormatterProfileName(null);
+			StandardProjectsManager.configureSettings(preferences);
+			assertEquals(DefaultCodeFormatterConstants.END_OF_LINE, JavaCore.getOption(DefaultCodeFormatterConstants.FORMATTER_BRACE_POSITION_FOR_BLOCK));
+			// invalid profile
+			preferences.setFormatterUrl(formatterUrl);
+			preferences.setFormatterProfileName("Invalid");
+			StandardProjectsManager.configureSettings(preferences);
+			assertEquals(DefaultCodeFormatterConstants.END_OF_LINE, JavaCore.getOption(DefaultCodeFormatterConstants.FORMATTER_BRACE_POSITION_FOR_BLOCK));
+			// empty profile (valid)
+			preferences.setFormatterUrl(formatterUrl);
+			preferences.setFormatterProfileName("");
+			StandardProjectsManager.configureSettings(preferences);
+			assertEquals(DefaultCodeFormatterConstants.NEXT_LINE, JavaCore.getOption(DefaultCodeFormatterConstants.FORMATTER_BRACE_POSITION_FOR_BLOCK));
+		} finally {
+			preferences.setFormatterUrl(null);
+			preferences.setFormatterProfileName(null);
+			StandardProjectsManager.configureSettings(preferences);
+		}
+		assertEquals(DefaultCodeFormatterConstants.END_OF_LINE, JavaCore.getOption(DefaultCodeFormatterConstants.FORMATTER_BRACE_POSITION_FOR_BLOCK));
 	}
 
 	@After
